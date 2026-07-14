@@ -61,15 +61,28 @@ import chromadb
 from chromadb.api.types import EmbeddingFunction
 
 # =============================================
-# 结构化日志
+# 结构化日志（终端 + 文件）
 # =============================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-5s | %(message)s',
-    datefmt='%H:%M:%S',
-)
+LOG_FILE = os.path.join(os.path.dirname(__file__), "rag_api.log")
+
 logger = logging.getLogger("rag-api")
+logger.setLevel(logging.INFO)
+
+# 终端 handler（stderr）
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-5s | %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(console)
+
+# 文件 handler（追加，UTF-8）
+file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)-5s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+))
+logger.addHandler(file_handler)
 
 def _log(trace_id: str, event: str, **fields):
     """结构化日志：一行一个事件，json 字段便于 grep"""
