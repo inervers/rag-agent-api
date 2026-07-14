@@ -1,7 +1,8 @@
-"""L5-Day1: FC RAG API + API Key 鉴权
+"""L5-Day3: FC RAG API + 结构化日志（API Key + 限流 + 全链路追踪）
 
-生产化第一步：所有接口加 API Key 校验。
-客户端需要在请求头中带 X-API-Key，否则返回 401。
+- 鉴权：X-API-Key 请求头
+- 限流：滑动窗口（配置 RAG_RATE_LIMIT）
+- 日志：trace_id 追踪、工具调用链路、请求耗时、错误记录
 """
 
 import sys, os, json
@@ -39,15 +40,15 @@ def _load_config():
 
 _load_config()
 
-# 从环境变量读取（.env 已注入）
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
-RAG_API_KEY = os.environ.get("RAG_API_KEY", "rag-secret-key-2024")  # 默认 key，生产环境请修改
+RAG_API_KEY = os.environ.get("RAG_API_KEY", "rag-secret-key-2024")
+RATE_LIMIT = int(os.environ.get("RAG_RATE_LIMIT", "30"))
 
 if not DEEPSEEK_API_KEY:
     print("需要设置 DEEPSEEK_API_KEY")
     exit(1)
 
-import time as time_module
+import time, uuid, logging, traceback
 import httpx
 from transformers import AutoTokenizer, AutoModel
 import torch
@@ -60,61 +61,101 @@ import chromadb
 from chromadb.api.types import EmbeddingFunction
 
 # =============================================
+# 结构化日志
+# =============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-5s | %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger("rag-api")
+
+def _log(trace_id: str, event: str, **fields):
+    """结构化日志：一行一个事件，json 字段便于 grep"""
+    parts = [f"[{trace_id[:8]}]", event]
+    for k, v in fields.items():
+        parts.append(f"{k}={v}")
+    logger.info(" | ".join(parts))
+
+def _log_tool(trace_id: str, func_name: str, args: dict, result_preview: str):
+    _log(trace_id, "tool_call", tool=func_name, args=json.dumps(args, ensure_ascii=False), result=result_preview[:80])
+
+# =============================================
 # 速率限制器
 # =============================================
 
-RATE_LIMIT = int(os.environ.get("RAG_RATE_LIMIT", "10"))  # 每分钟最多请求数
 WINDOW_SEC = 60
 
 class RateLimiter:
-    """滑动窗口速率限制器。记录每个 Key 的请求时间戳，超窗口的自动淘汰"""
     def __init__(self):
         self._records: dict[str, list[float]] = {}
 
     def check(self, key: str) -> tuple[bool, int, int]:
-        """
-        返回：(是否允许, 当前窗口内已用次数, 限制次数)
-        """
-        now = time_module.time()
+        now = time.time()
         window_start = now - WINDOW_SEC
-
         if key not in self._records:
             self._records[key] = []
-
-        # 剔除窗口外的时间戳
         self._records[key] = [t for t in self._records[key] if t > window_start]
-
         used = len(self._records[key])
         if used >= RATE_LIMIT:
             return False, used, RATE_LIMIT
-
         self._records[key].append(now)
         return True, used + 1, RATE_LIMIT
 
 rate_limiter = RateLimiter()
 
 # =============================================
-# 鉴权 + 限流中间件
+# 统一中间件（鉴权 + 限流 + 日志追踪）
 # =============================================
 
 AUTH_HEADER = "X-API-Key"
+TRACE_HEADER = "X-Trace-Id"
+
+async def logging_middleware(request: Request, call_next):
+    """最外层中间件：追踪、耗时、错误记录"""
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+    start = time.time()
+
+    _log(trace_id, "request", method=request.method, path=request.url.path)
+
+    try:
+        response = await call_next(request)
+        duration = round(time.time() - start, 3)
+        response.headers["X-Trace-Id"] = trace_id
+        if response.status_code < 400:
+            _log(trace_id, "response", status=response.status_code, duration=f"{duration}s")
+        else:
+            _log(trace_id, "response_error", status=response.status_code, duration=f"{duration}s")
+        return response
+    except Exception as e:
+        duration = round(time.time() - start, 3)
+        tb = traceback.format_exc()
+        _log(trace_id, "unhandled_error", error=str(e), duration=f"{duration}s")
+        logger.error(f"[{trace_id[:8]}] Unhandled:\n{tb}")
+        return JSONResponse(status_code=500, content={"error": "Internal server error", "trace_id": trace_id})
+
 
 async def security_middleware(request: Request, call_next):
-    """统一安全检查：鉴权 → 限流"""
-    # /health 允许不带 key 也不限流
+    """安全检查（鉴权 → 限流）"""
     if request.url.path == "/health":
         return await call_next(request)
 
-    # 1. 鉴权
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+
+    # 鉴权
     api_key = request.headers.get(AUTH_HEADER)
     if not api_key:
+        _log(trace_id, "auth_failed", reason="missing_key")
         return JSONResponse(status_code=401, content={"error": "Missing X-API-Key header"})
     if api_key != RAG_API_KEY:
+        _log(trace_id, "auth_failed", reason="invalid_key")
         return JSONResponse(status_code=403, content={"error": "Invalid API Key"})
 
-    # 2. 限流
+    # 限流
     allowed, used, limit = rate_limiter.check(api_key)
     if not allowed:
+        _log(trace_id, "rate_limited", used=used, limit=limit)
         return JSONResponse(
             status_code=429,
             content={"error": f"Rate limit exceeded: {used}/{limit} per minute"},
@@ -159,22 +200,21 @@ def _doc_count() -> int:
 def _doc_ids(start: int, n: int) -> list[str]:
     return [f"doc_{start + i}" for i in range(n)]
 
-# 初始化知识库
 if _doc_count() == 0:
     init_texts = [
-        "Python was created by Guido van Rossum and first released in 1991. It is a high-level general-purpose programming language emphasizing code readability with significant indentation. Python supports multiple programming paradigms including structured, object-oriented, and functional programming.",
-        "PyTorch was developed by Meta AI (Facebook AI Research) and released in 2016. It is an open-source machine learning framework. Key features include dynamic computation graphs, GPU-accelerated tensor computation, automatic differentiation with Autograd.",
-        "The Transformer architecture was introduced by Google in the 2017 paper 'Attention Is All You Need'. It relies entirely on self-attention mechanisms to process sequential data. It is the foundation for BERT, GPT, T5, and ViT.",
-        "RAG (Retrieval-Augmented Generation) combines a retriever and a generator. The retriever searches a knowledge base for relevant documents. These retrieved documents are fed as context to the LLM to produce informed answers grounded in real sources.",
-        "Chroma is an open-source vector database built for AI applications. It supports cosine similarity, L2 distance, and inner product. Chroma supports persistent storage and integrates natively with LangChain and LlamaIndex.",
-        "LangChain is an open-source framework for LLM application development. It provides modular abstractions for models, prompts, chains, memory, agents, and retrieval. Supports LCEL for composing pipelines.",
+        "Python was created by Guido van Rossum and first released in 1991. It is a high-level general-purpose programming language emphasizing code readability with significant indentation.",
+        "PyTorch was developed by Meta AI (Facebook AI Research) and released in 2016. Key features include dynamic computation graphs, GPU-accelerated tensor computation, automatic differentiation with Autograd.",
+        "The Transformer architecture was introduced by Google in the 2017 paper 'Attention Is All You Need'. It is the foundation for BERT, GPT, T5, and ViT.",
+        "RAG (Retrieval-Augmented Generation) combines a retriever and a generator. The retriever searches a knowledge base for relevant documents to produce informed answers.",
+        "Chroma is an open-source vector database built for AI applications. It supports persistent storage and integrates natively with LangChain and LlamaIndex.",
+        "LangChain is an open-source framework for LLM application development. It provides modular abstractions for models, prompts, chains, memory, agents, and retrieval.",
     ]
     chunks = splitter.split_documents([Document(t) for t in init_texts])
     ids = _doc_ids(1, len(chunks))
     collection.add(ids=ids, documents=[c.page_content for c in chunks], metadatas=[{"source": "init"} for _ in chunks])
-    print(f"▶ 知识库初始化：{len(chunks)} 个块")
+    logger.info(f"初始化知识库：{len(chunks)} 个块")
 else:
-    print(f"▶ 知识库已加载：{_doc_count()} 个块")
+    logger.info(f"知识库已加载：{_doc_count()} 个块")
 
 # =============================================
 # DeepSeek LLM
@@ -215,12 +255,8 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "add_document",
-        "description": "向知识库添加一条新知识（Chroma 持久化，重启不丢）",
-        "parameters": {
-            "type": "object",
-            "properties": {"title": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["title", "content"],
-        },
+        "description": "向知识库添加一条新知识",
+        "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "content": {"type": "string"}}, "required": ["title", "content"]},
     }},
     {"type": "function", "function": {
         "name": "summarize",
@@ -230,11 +266,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "translate",
         "description": "将文本翻译为目标语言",
-        "parameters": {
-            "type": "object",
-            "properties": {"text": {"type": "string"}, "target_language": {"type": "string"}},
-            "required": ["text", "target_language"],
-        },
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "target_language": {"type": "string"}}, "required": ["text", "target_language"]},
     }},
 ]
 
@@ -274,23 +306,27 @@ SYSTEM_PROMPT = (
     "5. Answer in the same language as the user."
 )
 
-def rag_with_fc(query: str) -> str:
+def rag_with_fc(query: str, trace_id: str = uuid.uuid4().hex) -> str:
+    _log(trace_id, "rag_start", query=query[:80])
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": query}]
+    tool_rounds = 0
     for _ in range(8):
         msg = call_llm(msgs, tools=TOOLS)
         if not msg.get("tool_calls"):
+            _log(trace_id, "rag_done", rounds=tool_rounds)
             return msg["content"]
         msgs.append({"role": "assistant", "content": msg.get("content"), "tool_calls": msg["tool_calls"]})
         for tc in msg["tool_calls"]:
             fname = tc["function"]["name"]
             fargs = json.loads(tc["function"]["arguments"] or "{}")
             result = TOOL_IMPLS[fname](**fargs)
-            print(f"  🛠  {fname}({json.dumps(fargs, ensure_ascii=False)})")
+            _log_tool(trace_id, fname, fargs, result)
             msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
+            tool_rounds += 1
+    _log(trace_id, "rag_max_rounds", rounds=tool_rounds)
     return msgs[-1].get("content", "")
 
-async def stream_rag(query: str):
-    """流式 FC 生成器。工具调用轮非流式，最后一轮流式"""
+async def stream_rag(query: str, trace_id: str):
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": query}]
     for _ in range(8):
         msg = call_llm(msgs, tools=TOOLS)
@@ -304,9 +340,9 @@ async def stream_rag(query: str):
                 fname = tc["function"]["name"]
                 fargs = json.loads(tc["function"]["arguments"] or "{}")
                 result = TOOL_IMPLS[fname](**fargs)
+                _log_tool(trace_id, fname, fargs, result)
                 msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
             continue
-        # 流式返回
         body = {
             "model": "deepseek-v4-flash", "messages": msgs,
             "temperature": 0.3, "thinking": {"type": "disabled"}, "stream": True,
@@ -331,7 +367,8 @@ async def stream_rag(query: str):
 # FastAPI 应用
 # =============================================
 
-app = FastAPI(title="RAG Agent API (Production)", version="1.2.0")
+app = FastAPI(title="RAG Agent API (Production)", version="1.3.0")
+app.middleware("http")(logging_middleware)
 app.middleware("http")(security_middleware)
 
 class QueryRequest(BaseModel):
@@ -342,48 +379,55 @@ class DocRequest(BaseModel):
     content: str
 
 @app.get("/health")
-def health():
+def health(request: Request):
     return {
         "status": "ok",
         "chunks": _doc_count(),
         "tools": list(TOOL_IMPLS.keys()),
         "auth_required": True,
         "rate_limit": f"{RATE_LIMIT}/min",
+        "version": "1.3.0",
     }
 
 @app.post("/query")
-def query(req: QueryRequest):
+def query(req: QueryRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
-    return {"answer": rag_with_fc(req.question)}
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+    answer = rag_with_fc(req.question, trace_id)
+    return {"answer": answer, "trace_id": trace_id}
 
 @app.post("/query/stream")
-async def query_stream(req: QueryRequest):
+async def query_stream(req: QueryRequest, request: Request):
     if not req.question.strip():
         raise HTTPException(400, "问题不能为空")
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
     return StreamingResponse(
-        stream_rag(req.question),
+        stream_rag(req.question, trace_id),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache", "Connection": "keep-alive",
+            "X-Accel-Buffering": "no", "X-Trace-Id": trace_id,
+        },
     )
 
 @app.post("/doc")
-def add_doc(req: DocRequest):
+def add_doc(req: DocRequest, request: Request):
     if not req.title.strip() or not req.content.strip():
         raise HTTPException(400, "标题和内容不能为空")
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
     result = _tool_add(req.title, req.content)
-    return {"message": result, "total_chunks": _doc_count()}
+    _log(trace_id, "doc_added", title=req.title[:40], chunks=result)
+    return {"message": result, "total_chunks": _doc_count(), "trace_id": trace_id}
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"启动 RAG Agent API（Production v1.2.0）...")
-    print(f"  API Key 鉴权：启用")
-    print(f"  速率限制：{RATE_LIMIT} 次/分钟")
-    print(f"  知识库：{_doc_count()} 个块")
-    print(f"  POST /query         →  问答（需 X-API-Key 头）")
-    print(f"  POST /query/stream  →  流式问答（需 X-API-Key 头）")
-    print(f"  POST /doc           →  添加知识（需 X-API-Key 头）")
-    print(f"  GET  /health        →  健康检查（无需鉴权）")
-    print(f"\n测试方法：")
-    print(f'  curl -H "X-API-Key: {RAG_API_KEY}" ...')
+    logger.info("=" * 50)
+    logger.info("RAG Agent API (Production v1.3.0)")
+    logger.info(f"API Key 鉴权：启用")
+    logger.info(f"速率限制：{RATE_LIMIT} 次/分钟")
+    logger.info(f"知识库：{_doc_count()} 个块")
+    logger.info(f"结构化日志：启用")
+    logger.info(f"用法：X-API-Key header + X-Trace-Id header(可选)")
+    logger.info("=" * 50)
     uvicorn.run(app, host="0.0.0.0", port=8000)
