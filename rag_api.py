@@ -7,8 +7,9 @@
 
 import sys, os, json
 
-_REAL_USER_SITE = r"C:\Users\inervers\AppData\Roaming\Python\Python313\site-packages"
-if os.path.isdir(_REAL_USER_SITE) and _REAL_USER_SITE not in sys.path:
+# Windows user-site 兼容（Docker 中直接跳过）
+_REAL_USER_SITE = os.environ.get("PYTHON_USER_SITE")
+if _REAL_USER_SITE and os.path.isdir(_REAL_USER_SITE) and _REAL_USER_SITE not in sys.path:
     sys.path.insert(0, _REAL_USER_SITE)
 
 os.environ.setdefault("HF_HOME", r"C:\Users\inervers\Desktop\OH-WorkSpace\dl-learning\hf_cache")
@@ -64,7 +65,7 @@ from chromadb.api.types import EmbeddingFunction
 # 结构化日志（终端 + 文件）
 # =============================================
 
-LOG_FILE = os.path.join(os.path.dirname(__file__), "rag_api.log")
+LOG_FILE = os.environ.get("RAG_LOG_FILE", os.path.join(os.path.dirname(__file__), "rag_api.log"))
 
 logger = logging.getLogger("rag-api")
 logger.setLevel(logging.INFO)
@@ -199,7 +200,7 @@ class MiniLMEmbedding(EmbeddingFunction):
 # =============================================
 # Chroma 持久化
 # =============================================
-CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
+CHROMA_DIR = os.environ.get("RAG_CHROMA_DIR", os.path.join(os.path.dirname(__file__), "chroma_db"))
 client = chromadb.PersistentClient(path=CHROMA_DIR, settings=chromadb.config.Settings(anonymized_telemetry=False))
 collection = client.get_or_create_collection(name="rag_knowledge", embedding_function=MiniLMEmbedding())
 splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)

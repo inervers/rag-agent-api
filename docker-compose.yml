@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  rag-api:
+    build: .
+    container_name: rag-agent-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 持久化知识库
+      - chroma_data:/data/chroma_db
+      # 日志持久化
+      - ./logs:/data/logs
+      # HuggingFace 模型缓存（复用，避免反复下载）
+      - hf_cache:/root/.cache/huggingface
+    env_file:
+      - .env
+    environment:
+      - RAG_CHROMA_DIR=/data/chroma_db
+      - RAG_LOG_FILE=/data/logs/rag_api.log
+      - HF_HOME=/root/.cache/huggingface
+      - HF_HUB_DISABLE_SYMLINKS=1
+
+volumes:
+  chroma_data:
+  hf_cache:
