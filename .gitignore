@@ -4,3 +4,5 @@ chroma_db/
 *.log
 stream_out*
 .env
+memory/
+models/

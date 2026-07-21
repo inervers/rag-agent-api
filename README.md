@@ -42,15 +42,21 @@ docker compose down
 | 速率限制 | 滑动窗口限流，超限返回 429 | v1.1 |
 | 结构化日志 | 全链路 trace_id 追踪，单行 JSON 格式，自动写入文件 | v1.2 |
 | Docker 部署 | 容器化运行，持久化 chroma_db + 日志 + 模型缓存 | v1.3 |
+| 多路召回 | 稠密向量 + BM25 稀疏 + RRF 融合 | v2.0 |
+| Reranker 精排 | Cross-Encoder 重排序提升精度 | v2.0 |
+| Multi-Agent 编排 | 研究员、写作者、审核员，带持久化记忆和监控 | v2.0 |
 
 ## API
 
 | 接口 | 鉴权 | 说明 |
 |---|---|---|
 | GET /health | 免鉴权 | 健康检查 |
-| POST /query | X-API-Key | 问答（FC 驱动 RAG） |
+| POST /query | X-API-Key | 标准问答（FC 驱动 RAG） |
 | POST /query/stream | X-API-Key | 流式问答（SSE） |
+| POST /query/hybrid | X-API-Key | 多路召回（稠密 + BM25），可选 Reranker |
 | POST /doc | X-API-Key | 添加知识 |
+| GET /kb/docs | X-API-Key | 获取知识库全部文档 |
+| POST /agent/write | X-API-Key | Multi-Agent 写作流水线 |
 
 ### 测试命令
 

@@ -392,6 +392,17 @@ class DocRequest(BaseModel):
     title: str
     content: str
 
+class HybridQueryRequest(BaseModel):
+    question: str
+    top_k: int = 10
+    dense_weight: float = 1.0
+    sparse_weight: float = 1.0
+    use_reranker: bool = False
+
+class AgentWriteRequest(BaseModel):
+    topic: str
+    max_retries: int = 1
+
 @app.get("/health")
 def health(request: Request):
     return {
@@ -433,6 +444,74 @@ def add_doc(req: DocRequest, request: Request):
     result = _tool_add(req.title, req.content)
     _log(trace_id, "doc_added", title=req.title[:40], chunks=result)
     return {"message": result, "total_chunks": _doc_count(), "trace_id": trace_id}
+
+# =============================================
+# 高级检索（Hybrid + Reranker）
+# =============================================
+
+_hybrid_search = None
+_reranker = None
+
+def _get_hybrid_search():
+    global _hybrid_search
+    if _hybrid_search is None:
+        from rag_advanced import HybridSearch
+        all_docs = collection.get()
+        corpus = all_docs.get("documents", [])
+        _hybrid_search = HybridSearch(collection, embed_texts, corpus)
+    return _hybrid_search
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        from rag_advanced import Reranker
+        _reranker = Reranker()
+    return _reranker
+
+@app.get("/kb/docs")
+def list_kb_docs(request: Request):
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+    all_docs = collection.get()
+    docs = all_docs.get("documents", [])
+    _log(trace_id, "kb_list", count=len(docs))
+    return {"count": len(docs), "documents": docs, "trace_id": trace_id}
+
+@app.post("/query/hybrid")
+def hybrid_query(req: HybridQueryRequest, request: Request):
+    if not req.question.strip():
+        raise HTTPException(400, "问题不能为空")
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+    _log(trace_id, "hybrid_query", query=req.question[:80])
+    hs = _get_hybrid_search()
+    result = hs.search(query=req.question, top_k=req.top_k,
+                       dense_weight=req.dense_weight, sparse_weight=req.sparse_weight)
+    if req.use_reranker:
+        reranker = _get_reranker()
+        candidates = result["dense_top"] + result.get("hybrid_top", [])
+        result["reranked"] = reranker.rerank(req.question, candidates, top_k=5)
+        _log(trace_id, "reranker_done", candidates=len(candidates))
+    _log(trace_id, "hybrid_done", dense=len(result["dense_top"]),
+         hybrid=len(result["hybrid_top"]))
+    return {"result": result, "trace_id": trace_id}
+
+# =============================================
+# Multi-Agent 编排
+# =============================================
+
+@app.post("/agent/write")
+def agent_write(req: AgentWriteRequest, request: Request):
+    if not req.topic.strip():
+        raise HTTPException(400, "主题不能为空")
+    trace_id = request.headers.get(TRACE_HEADER, uuid.uuid4().hex)
+    _log(trace_id, "agent_write_start", topic=req.topic[:40])
+    from rag_multiagent import MultiAgentWorkflow
+    wf = MultiAgentWorkflow(api_key=DEEPSEEK_API_KEY,
+                            base_url="https://api.deepseek.com/v1")
+    result = wf.run(req.topic, max_retries=req.max_retries)
+    _log(trace_id, "agent_write_done", passed=str(result["passed"]),
+         rating=result["rating"], attempts=result["attempts"],
+         duration=f"{result['duration_s']}s")
+    return {"result": result, "trace_id": trace_id}
 
 if __name__ == "__main__":
     import uvicorn

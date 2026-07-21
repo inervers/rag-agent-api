@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 #     AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
 
 # 复制代码
-COPY rag_api.py .
-RUN mkdir -p /data/chroma_db /data/logs
+COPY rag_api.py rag_advanced.py rag_multiagent.py .
+RUN mkdir -p /data/chroma_db /data/logs /app/memory
 
 EXPOSE 8000
 
