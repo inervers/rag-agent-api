@@ -7,9 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 预下载嵌入模型
-RUN python -c "from transformers import AutoTokenizer, AutoModel; \
-    AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2'); \
-    AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
+# 预下载嵌入模型（建议：若网络不通则首次请求时自动下载）
+# RUN python -c "from transformers import AutoTokenizer, AutoModel; \
+#     AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2'); \
+#     AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
 
 # 复制代码
 COPY rag_api.py .
